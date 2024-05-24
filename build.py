@@ -30,15 +30,21 @@
 #
 # This script also generates:
 #   blocks_compressed.js: The compressed common blocks.
+#   blocks_horizontal_compressed.js: The compressed Scratch horizontal blocks.
 #   blocks_vertical_compressed.js: The compressed Scratch vertical blocks.
 #   msg/js/<LANG>.js for every language <LANG> defined in msg/js/<LANG>.json.
 
 import sys
-if sys.version_info[0] != 2:
-  raise Exception("Blockly build only compatible with Python 2.x.\n"
-                  "You are using: " + sys.version)
 
-import errno, glob, httplib, json, os, re, subprocess, threading, urllib
+import errno, glob, json, os, re, subprocess, threading, codecs, functools, platform
+
+if sys.version_info[0] == 2:
+  import httplib
+  from urllib import urlencode
+else:
+  import http.client as httplib
+  from urllib.parse import urlencode
+  from importlib import reload
 
 REMOTE_COMPILER = "remote"
 
@@ -91,7 +97,10 @@ class Gen_uncompressed(threading.Thread):
     self.closure_env = closure_env
 
   def run(self):
-    target_filename = 'blockly_uncompressed_vertical.js'
+    if self.vertical:
+      target_filename = 'blockly_uncompressed_vertical.js'
+    else:
+      target_filename = 'blockly_uncompressed_horizontal.js'
     f = open(target_filename, 'w')
     f.write(HEADER)
     f.write(self.format_js("""
@@ -107,7 +116,7 @@ window.BLOCKLY_DIR = (function() {
   if (!isNodeJS) {
     // Find name of current directory.
     var scripts = document.getElementsByTagName('script');
-    var re = new RegExp('(.+)[\/]blockly_uncompressed_vertical\.js$');
+    var re = new RegExp('(.+)[\\/]blockly_uncompressed(_vertical|_horizontal|)\\.js$');
     for (var i = 0, script; script = scripts[i]; i++) {
       var match = re.exec(script.src);
       if (match) {
@@ -190,7 +199,7 @@ if (isNodeJS) {
 
     key_whitelist = self.closure_env.keys()
 
-    keys_pipe_separated = reduce(lambda accum, key: accum + "|" + key, key_whitelist)
+    keys_pipe_separated = functools.reduce(lambda accum, key: accum + "|" + key, key_whitelist)
     begin_brace = re.compile(r"\{(?!%s)" % (keys_pipe_separated,))
 
     end_brace = re.compile(r"\}")
@@ -213,20 +222,26 @@ class Gen_compressed(threading.Thread):
   Uses the Closure Compiler's online API.
   Runs in a separate thread.
   """
-  def __init__(self, search_paths_vertical, closure_env):
+  def __init__(self, search_paths_vertical, search_paths_horizontal, closure_env):
     threading.Thread.__init__(self)
     self.search_paths_vertical = search_paths_vertical
+    self.search_paths_horizontal = search_paths_horizontal
     self.closure_env = closure_env
 
   def run(self):
     self.gen_core(True)
     self.gen_core(False)
+    self.gen_blocks("horizontal")
     self.gen_blocks("vertical")
     self.gen_blocks("common")
 
   def gen_core(self, vertical):
-    target_filename = 'blockly_compressed_vertical.js'
-    search_paths = self.search_paths_vertical
+    if vertical:
+      target_filename = 'blockly_compressed_vertical.js'
+      search_paths = self.search_paths_vertical
+    else:
+      target_filename = 'blockly_compressed_horizontal.js'
+      search_paths = self.search_paths_horizontal
     # Define the parameters for the POST request.
     params = [
       ("compilation_level", "SIMPLE"),
@@ -253,7 +268,10 @@ class Gen_compressed(threading.Thread):
     self.do_compile(params, target_filename, filenames, "")
 
   def gen_blocks(self, block_type):
-    if block_type == "vertical":
+    if block_type == "horizontal":
+      target_filename = "blocks_compressed_horizontal.js"
+      filenames = glob.glob(os.path.join("blocks_horizontal", "*.js"))
+    elif block_type == "vertical":
       target_filename = "blocks_compressed_vertical.js"
       filenames = glob.glob(os.path.join("blocks_vertical", "*.js"))
     elif block_type == "common":
@@ -315,15 +333,27 @@ class Gen_compressed(threading.Thread):
       for group in [[CLOSURE_COMPILER_NPM], dash_args]:
         args.extend(filter(lambda item: item, group))
 
+      # On Windows, the command line is too long, so we save the arguments to a file instead
+      use_flagfile = platform.system() == "Windows"
+      if platform.system() == "Windows":
+        flagfile_name = target_filename + ".config"
+        with open(flagfile_name, "w") as f:
+          # \ needs to be escaped still
+          f.write(" ".join(args[1:]).replace("\\", "\\\\"))
+        args = [CLOSURE_COMPILER_NPM, "--flagfile", flagfile_name]
+
       proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
       (stdout, stderr) = proc.communicate()
+
+      if use_flagfile:
+        os.remove(flagfile_name)
 
       # Build the JSON response.
       filesizes = [os.path.getsize(value) for (arg, value) in params if arg == "js_file"]
       return dict(
         compiledCode=stdout,
         statistics=dict(
-          originalSize=reduce(lambda v, size: v + size, filesizes, 0),
+          originalSize=functools.reduce(lambda v, size: v + size, filesizes, 0),
           compressedSize=len(stdout),
         )
       )
@@ -360,9 +390,10 @@ class Gen_compressed(threading.Thread):
 
       headers = {"Content-type": "application/x-www-form-urlencoded"}
       conn = httplib.HTTPSConnection("closure-compiler.appspot.com")
-      conn.request("POST", "/compile", urllib.urlencode(remoteParams), headers)
+      conn.request("POST", "/compile", urlencode(remoteParams), headers)
       response = conn.getresponse()
-      json_str = response.read()
+      # Decode is necessary for Python 3.4 compatibility
+      json_str = response.read().decode("utf-8")
       conn.close()
 
       # Parse the JSON response.
@@ -375,12 +406,12 @@ class Gen_compressed(threading.Thread):
       n = int(name[6:]) - 1
       return filenames[n]
 
-    if json_data.has_key("serverErrors"):
+    if "serverErrors" in json_data:
       errors = json_data["serverErrors"]
       for error in errors:
         print("SERVER ERROR: %s" % target_filename)
         print(error["error"])
-    elif json_data.has_key("errors"):
+    elif "errors" in json_data:
       errors = json_data["errors"]
       for error in errors:
         print("FATAL ERROR")
@@ -392,7 +423,7 @@ class Gen_compressed(threading.Thread):
           print((" " * error["charno"]) + "^")
         sys.exit(1)
     else:
-      if json_data.has_key("warnings"):
+      if "warnings" in json_data:
         warnings = json_data["warnings"]
         for warning in warnings:
           print("WARNING")
@@ -409,23 +440,23 @@ class Gen_compressed(threading.Thread):
     return False
 
   def write_output(self, target_filename, remove, json_data):
-      if not json_data.has_key("compiledCode"):
+      if "compiledCode" not in json_data:
         print("FATAL ERROR: Compiler did not return compiledCode.")
         sys.exit(1)
 
-      code = HEADER + "\n" + json_data["compiledCode"]
+      code = HEADER + "\n" + json_data["compiledCode"].decode("utf-8")
       code = code.replace(remove, "")
 
       # Trim down Google's (and only Google's) Apache licences.
       # The Closure Compiler preserves these.
       LICENSE = re.compile("""/\\*
 
- [\w ]+
+ [\\w ]+
 
  Copyright \\d+ Google Inc.
  https://developers.google.com/blockly/
 
- Licensed under the Apache License, Version 2.0 \(the "License"\);
+ Licensed under the Apache License, Version 2.0 \\(the "License"\\);
  you may not use this file except in compliance with the License.
  You may obtain a copy of the License at
 
@@ -487,7 +518,7 @@ class Gen_langfiles(threading.Thread):
           # If a destination file was missing, rebuild.
           return True
       else:
-        print("Error checking file creation times: " + e)
+        print("Error checking file creation times: " + str(e))
 
   def run(self):
     # The files msg/json/{en,qqq,synonyms}.json depend on msg/messages.js.
@@ -539,6 +570,12 @@ class Gen_langfiles(threading.Thread):
       else:
         print("FAILED to create " + f)
 
+def exclude_vertical(item):
+  return not item.endswith("block_render_svg_vertical.js")
+
+def exclude_horizontal(item):
+  return not item.endswith("block_render_svg_horizontal.js")
+
 if __name__ == "__main__":
   try:
     closure_dir = CLOSURE_DIR_NPM
@@ -554,39 +591,29 @@ if __name__ == "__main__":
     test_args = [closure_compiler, os.path.join("build", "test_input.js")]
     test_proc = subprocess.Popen(test_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     (stdout, _) = test_proc.communicate()
-    assert stdout == read(os.path.join("build", "test_expect.js"))
+    assert stdout.decode("utf-8") == read(os.path.join("build", "test_expect.js"))
 
     print("Using local compiler: %s ...\n" % CLOSURE_COMPILER_NPM)
   except (ImportError, AssertionError):
-    print("Using remote compiler: closure-compiler.appspot.com ...\n")
-
-    try:
-      closure_dir = CLOSURE_DIR
-      closure_root = CLOSURE_ROOT
-      closure_library = CLOSURE_LIBRARY
-      closure_compiler = CLOSURE_COMPILER
-
-      calcdeps = import_path(os.path.join(
-          closure_root, closure_library, "closure", "bin", "calcdeps.py"))
-    except ImportError:
-      if os.path.isdir(os.path.join(os.path.pardir, "closure-library-read-only")):
-        # Dir got renamed when Closure moved from Google Code to GitHub in 2014.
-        print("Error: Closure directory needs to be renamed from"
-              "'closure-library-read-only' to 'closure-library'.\n"
-              "Please rename this directory.")
-      elif os.path.isdir(os.path.join(os.path.pardir, "google-closure-library")):
-        print("Error: Closure directory needs to be renamed from"
-             "'google-closure-library' to 'closure-library'.\n"
-             "Please rename this directory.")
-      else:
-        print("""Error: Closure not found.  Read this:
+    if os.path.isdir(os.path.join(os.path.pardir, "closure-library-read-only")):
+      # Dir got renamed when Closure moved from Google Code to GitHub in 2014.
+      print("Error: Closure directory needs to be renamed from"
+            "'closure-library-read-only' to 'closure-library'.\n"
+            "Please rename this directory.")
+    elif os.path.isdir(os.path.join(os.path.pardir, "google-closure-library")):
+      print("Error: Closure directory needs to be renamed from"
+            "'google-closure-library' to 'closure-library'.\n"
+            "Please rename this directory.")
+    else:
+      print("""Error: Closure not found. Usually this means 'npm ci' failed. Try running it again? More resources:
   developers.google.com/blockly/guides/modify/web/closure""")
       sys.exit(1)
 
-  search_paths = calcdeps.ExpandDirectories(
-      ["core", os.path.join(closure_root, closure_library)])
+  search_paths = list(calcdeps.ExpandDirectories(
+      ["core", os.path.join(closure_root, closure_library)]))
 
-  search_paths_vertical = search_paths
+  search_paths_horizontal = list(filter(exclude_vertical, search_paths))
+  search_paths_vertical = list(filter(exclude_horizontal, search_paths))
 
   closure_env = {
     "closure_dir": closure_dir,
@@ -598,11 +625,23 @@ if __name__ == "__main__":
   # Run all tasks in parallel threads.
   # Uncompressed is limited by processor speed.
   # Compressed is limited by network and server speed.
-  # Vertical:
-  Gen_uncompressed(search_paths_vertical, True, closure_env).start()
+  threads = [
+    # Vertical:
+    Gen_uncompressed(search_paths_vertical, True, closure_env),
+    # Horizontal:
+    Gen_uncompressed(search_paths_horizontal, False, closure_env),
+    # Compressed forms of vertical and horizontal.
+    Gen_compressed(search_paths_vertical, search_paths_horizontal, closure_env),
 
-  # Compressed forms of vertical
-  Gen_compressed(search_paths_vertical, closure_env).start()
+    # This is run locally in a separate thread.
+    # Gen_langfiles()
+  ]
 
-  # This is run locally in a separate thread.
-  # Gen_langfiles().start()
+  for thread in threads:
+    thread.start()
+
+  # Need to wait for all threads to finish before the main process ends as in Python 3.12,
+  # once the main interpreter is being shutdown, trying to spawn more child threads will
+  # raise "RuntimeError: can't create new thread at interpreter shutdown"
+  for thread in threads:
+    thread.join()
